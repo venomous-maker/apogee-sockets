@@ -1,0 +1,510 @@
+// sockets.grav — a WebSocket server for real-time events, speaking the Pusher
+// Channels protocol (version 7): browsers connect with pusher-js or Laravel
+// Echo, and the app sends events through its HTTP API (apogee-broadcast's
+// SocketsBroadcaster, or any Pusher server library).
+//
+//   let server = new SocketsServer(new SocketsConfig([new SocketsApp("app-id", "app-key", "app-secret")]))
+//   server.serve("0.0.0.0", 6001)            // ws://host:6001/app/app-key, POST /apps/app-id/events
+//
+// Channels: public ("orders"), private ("private-orders.7": the app signs each
+// subscription), and presence ("presence-chat.1": private, plus who is there).
+// Clients may send "client-" events on private and presence channels to the
+// others subscribed. Each connection runs on its own thread; the channels are
+// shared under a lock, and sends happen outside it.
+import "std"
+import "std/net"
+
+namespace apogee {
+
+    // An app that may use the server: its id (in the HTTP API's paths), its
+    // public key (in the WebSocket URL) and its secret (for signatures).
+    class SocketsApp {
+        public id: string
+        public key: string
+        public secret: string
+        // Connections allowed at once (0: no limit).
+        public maxConnections: int = 0
+        // Whether clients may send client- events.
+        public clientEvents: bool = true
+        constructor(id: string, key: string, secret: string) { self.id = id; self.key = key; self.secret = secret; }
+    }
+
+    class SocketsConfig {
+        public apps: Array<SocketsApp>
+        // Seconds of quiet after which a client should ping (told to it on connecting).
+        public activityTimeout: int = 30
+        // The largest message a client may send.
+        public maxMessageBytes: int = 10000
+        // Origins (scheme://host[:port]) browsers may connect from; empty for any.
+        public allowedOrigins: Array<string> = new Array<string>()
+        constructor(apps: Array<SocketsApp>) { self.apps = apps; }
+        // One app from SOCKETS_APP_ID, SOCKETS_APP_KEY and SOCKETS_APP_SECRET (and
+        // SOCKETS_ALLOWED_ORIGINS, comma-separated, when set).
+        static fn fromEnv() -> SocketsConfig {
+            let id = env("SOCKETS_APP_ID");
+            let key = env("SOCKETS_APP_KEY");
+            let secret = env("SOCKETS_APP_SECRET");
+            if (id == "" || key == "" || secret == "") {
+                throw new StateError("set SOCKETS_APP_ID, SOCKETS_APP_KEY and SOCKETS_APP_SECRET");
+            }
+            let apps = new Array<SocketsApp>();
+            apps.push(new SocketsApp(id, key, secret));
+            let c = new SocketsConfig(apps);
+            for (o in Str.split(env("SOCKETS_ALLOWED_ORIGINS"), ",")) { if (Str.trim(o) != "") { c.allowedOrigins.push(Str.trim(o)); } }
+            return c;
+        }
+    }
+
+    // The protocol's signatures (HMAC-SHA256, hex).
+    class PusherSignature {
+        // The "auth" a private or presence subscription needs: "key:signature" of
+        // "socket_id:channel" (and ":channel_data" for presence).
+        static fn channelAuth(key: string, secret: string, socketId: string, channel: string, channelData: string = "") -> string {
+            let text = socketId + ":" + channel + (channelData == "" ? "" : ":" + channelData);
+            return key + ":" + Hash.hmacSha256(secret, text);
+        }
+        // An HTTP API request's auth_signature: of "METHOD\nPATH\nsorted query".
+        static fn apiSignature(secret: string, method: string, path: string, params: SortedMap<string, string>) -> string {
+            return Hash.hmacSha256(secret, method + "\n" + path + "\n" + PusherSignature.queryString(params));
+        }
+        // key=value pairs sorted by key, joined with "&" (auth_signature left out).
+        static fn queryString(params: SortedMap<string, string>) -> string {
+            let parts = new Array<string>();
+            for ((k, v) in params) { if (k != "auth_signature") { parts.push(k + "=" + v); } }
+            return Str.join(parts, "&");
+        }
+        static fn params() -> SortedMap<string, string> { return new SortedMap<string, string>(fn(a: string, b: string) => Str.compare(a, b)); }
+    }
+
+    // A browser's connection.
+    class SocketConnection {
+        public socketId: string
+        public app: SocketsApp
+        public ws: WebSocket
+        // channel -> the presence user id it joined with ("" elsewhere)
+        public channels: HashMap<string, string>
+        constructor(socketId: string, app: SocketsApp, ws: WebSocket) {
+            self.socketId = socketId;
+            self.app = app;
+            self.ws = ws;
+            self.channels = new HashMap<string, string>();
+        }
+        fn send(event: string, channel: string, data: string) {
+            let o = Json.object();
+            o.set("event", event);
+            if (channel != "") { o.set("channel", channel); }
+            o.set("data", data);
+            try { self.ws.send(o.toJson()); } catch (e: Exception) {}   // (gone: its thread cleans up)
+        }
+    }
+
+    // Someone in a presence channel: their info, and how many of their
+    // connections are subscribed (they leave when the last one does).
+    class PresenceMember {
+        public info: JsonValue
+        public count: int = 1
+        constructor(info: JsonValue) { self.info = info; }
+    }
+
+    class SocketChannel {
+        public name: string
+        public subscribers: HashMap<string, SocketConnection>
+        public members: HashMap<string, PresenceMember>
+        constructor(name: string) {
+            self.name = name;
+            self.subscribers = new HashMap<string, SocketConnection>();
+            self.members = new HashMap<string, PresenceMember>();
+        }
+        fn isPresence() -> bool { return Str.startsWith(self.name, "presence-"); }
+    }
+
+    class SocketsServer {
+        public config: SocketsConfig
+        private http: HttpServer
+        private byKey: HashMap<string, SocketsApp>
+        private byId: HashMap<string, SocketsApp>
+        // app id -> channel name -> channel
+        private channels: HashMap<string, HashMap<string, SocketChannel>>
+        private connections: HashMap<string, int>   // app id -> open connections
+        private lock: Mutex
+
+        constructor(config: SocketsConfig) {
+            self.config = config;
+            self.byKey = new HashMap<string, SocketsApp>();
+            self.byId = new HashMap<string, SocketsApp>();
+            self.channels = new HashMap<string, HashMap<string, SocketChannel>>();
+            self.connections = new HashMap<string, int>();
+            self.lock = new Mutex();
+            for (a in config.apps) {
+                self.byKey.put(a.key, a);
+                self.byId.put(a.id, a);
+                self.channels.put(a.id, new HashMap<string, SocketChannel>());
+                self.connections.put(a.id, 0);
+            }
+            self.http = new HttpServer();
+            self.routes();
+        }
+
+        // Serves (blocks).
+        fn serve(host: string, port: int) { self.http.listen(host, port); }
+        // Serves in the background; returns once listening.
+        fn start(host: string, port: int) -> SocketsServer { self.http.start(host, port); return self; }
+        fn port() -> int { return self.http.port(); }
+        fn stop() { self.http.stop(); }
+
+        // ── HTTP ───────────────────────────────────────────────────────────────
+        private fn routes() {
+            self.http.upgrade("/app/:key", fn(req: HttpRequest, conn: TcpStream) { self.onUpgrade(req, conn); });
+            self.http.get("/up", fn(req: HttpRequest) -> HttpResponse { return HttpResponse.of(200, "application/json", "{\"health\":\"OK\"}"); });
+            self.http.post("/apps/:app/events", fn(req: HttpRequest) -> HttpResponse { return self.api(req, "events"); });
+            self.http.post("/apps/:app/batch_events", fn(req: HttpRequest) -> HttpResponse { return self.api(req, "batch"); });
+            self.http.get("/apps/:app/channels", fn(req: HttpRequest) -> HttpResponse { return self.api(req, "channels"); });
+            self.http.get("/apps/:app/channels/:channel", fn(req: HttpRequest) -> HttpResponse { return self.api(req, "channel"); });
+            self.http.get("/apps/:app/channels/:channel/users", fn(req: HttpRequest) -> HttpResponse { return self.api(req, "users"); });
+        }
+
+        private static fn error(status: int, message: string) -> HttpResponse {
+            let o = Json.object();
+            o.set("error", message);
+            return HttpResponse.json(status, o);
+        }
+
+        // A signed HTTP API request (the Pusher HTTP API's scheme).
+        private fn api(req: HttpRequest, what: string) -> HttpResponse {
+            let app = self.byId.getOr(req.param("app"), null);
+            if (app == null) { return SocketsServer.error(404, "unknown app"); }
+            let params = PusherSignature.params();
+            for ((k, v) in req.queryParams()) { params.put(Str.lower(k), v); }
+            if (params.getOr("auth_key", "") != app.key) { return SocketsServer.error(401, "unknown auth_key"); }
+            let ts = Integer.parseOr(params.getOr("auth_timestamp", ""), 0);
+            if (ts == 0 || Math.abs(Time.now() - ts) > 600) { return SocketsServer.error(401, "auth_timestamp is missing or more than 600 seconds off"); }
+            let body = req.body();
+            if (body != "" && params.getOr("body_md5", "") != Hash.md5(body)) { return SocketsServer.error(401, "body_md5 does not match the body"); }
+            let expected = PusherSignature.apiSignature(app.secret, req.method, req.path, params);
+            if (!Hash.equals(params.getOr("auth_signature", ""), expected)) { return SocketsServer.error(401, "invalid auth_signature"); }
+            switch (what) {
+                case "events": return self.apiEvent(app, body)
+                case "batch": return self.apiBatch(app, body)
+                case "channels": return self.apiChannels(app, params)
+                case "channel": return self.apiChannel(app, Url.decode(req.param("channel")), params)
+                default: return self.apiUsers(app, Url.decode(req.param("channel")))
+            }
+        }
+        private fn apiEvent(app: SocketsApp, body: string) -> HttpResponse {
+            let j: JsonValue = null;
+            try { j = Json.parse(body); } catch (e: ValueError) { return SocketsServer.error(400, "the body is not JSON"); }
+            let err = self.triggerJson(app, j);
+            return err != "" ? SocketsServer.error(400, err) : HttpResponse.of(200, "application/json", "{}");
+        }
+        private fn apiBatch(app: SocketsApp, body: string) -> HttpResponse {
+            let j: JsonValue = null;
+            try { j = Json.parse(body); } catch (e: ValueError) { return SocketsServer.error(400, "the body is not JSON"); }
+            if (!j.has("batch") || !j.get("batch").isArray()) { return SocketsServer.error(400, "expected {\"batch\": [...]}"); }
+            for (e in j.get("batch").asArray()) {
+                let err = self.triggerJson(app, e);
+                if (err != "") { return SocketsServer.error(400, err); }
+            }
+            return HttpResponse.of(200, "application/json", "{\"batch\":[]}");
+        }
+        // {"name", "data", "channels" | "channel", "socket_id"?}; "" or what is wrong.
+        private fn triggerJson(app: SocketsApp, j: JsonValue) -> string {
+            if (!j.isObject() || !j.has("name")) { return "an event needs a name"; }
+            let names = new Array<string>();
+            if (j.has("channels") && j.get("channels").isArray()) { for (c in j.get("channels").asArray()) { names.push(c.asString()); } }
+            if (j.has("channel")) { names.push(j.get("channel").asString()); }
+            if (names.size() == 0) { return "an event needs channels"; }
+            if (names.size() > 100) { return "at most 100 channels per event"; }
+            let data = j.has("data") ? (j.get("data").isString() ? j.get("data").asString() : j.get("data").toJson()) : "{}";
+            self.trigger(app.id, names, j.get("name").asString(), data, j.has("socket_id") ? j.get("socket_id").asString() : "");
+            return "";
+        }
+        private fn apiChannels(app: SocketsApp, params: SortedMap<string, string>) -> HttpResponse {
+            let prefix = params.getOr("filter_by_prefix", "");
+            let withUsers = Str.contains(params.getOr("info", ""), "user_count");
+            let out = Json.object();
+            let list = Json.object();
+            self.lock.lock();
+            for ((name, ch) in self.channels.get(app.id)) {
+                if (ch.subscribers.size() == 0 || !Str.startsWith(name, prefix)) { continue; }
+                let info = Json.object();
+                if (withUsers && ch.isPresence()) { info.set("user_count", ch.members.size() as long); }
+                list.set(name, info);
+            }
+            self.lock.unlock();
+            out.set("channels", list);
+            return HttpResponse.json(200, out);
+        }
+        private fn apiChannel(app: SocketsApp, name: string, params: SortedMap<string, string>) -> HttpResponse {
+            let info = params.getOr("info", "");
+            let out = Json.object();
+            self.lock.lock();
+            let ch = self.channels.get(app.id).getOr(name, null);
+            let subs = ch == null ? 0 : ch.subscribers.size();
+            let users = ch == null ? 0 : ch.members.size();
+            self.lock.unlock();
+            out.set("occupied", subs > 0);
+            if (Str.contains(info, "subscription_count")) { out.set("subscription_count", subs as long); }
+            if (Str.contains(info, "user_count") && Str.startsWith(name, "presence-")) { out.set("user_count", users as long); }
+            return HttpResponse.json(200, out);
+        }
+        private fn apiUsers(app: SocketsApp, name: string) -> HttpResponse {
+            if (!Str.startsWith(name, "presence-")) { return SocketsServer.error(400, "users are only for presence channels"); }
+            let users = Json.array();
+            self.lock.lock();
+            let ch = self.channels.get(app.id).getOr(name, null);
+            if (ch != null) {
+                for ((id, _) in ch.members) {
+                    let u = Json.object();
+                    u.set("id", id);
+                    users.push(u);
+                }
+            }
+            self.lock.unlock();
+            let out = Json.object();
+            out.set("users", users);
+            return HttpResponse.json(200, out);
+        }
+
+        // ── events ─────────────────────────────────────────────────────────────
+        // Sends `event` (its data: JSON text) to everyone on `channels`, but the
+        // connection `exceptSocket`.
+        fn trigger(appId: string, channels: Array<string>, event: string, data: string, exceptSocket: string = "") {
+            let to = new Array<SocketConnection>();
+            let chans = new Array<string>();
+            self.lock.lock();
+            let all = self.channels.getOr(appId, null);
+            if (all != null) {
+                for (name in channels) {
+                    let ch = all.getOr(name, null);
+                    if (ch == null) { continue; }
+                    for ((sid, c) in ch.subscribers) {
+                        if (sid != exceptSocket) { to.push(c); chans.push(name); }
+                    }
+                }
+            }
+            self.lock.unlock();
+            for (i in 0..to.size()) { to[i].send(event, chans[i], data); }
+        }
+        // How many connections are subscribed to a channel.
+        fn subscriptionCount(appId: string, channel: string) -> int {
+            self.lock.lock();
+            let all = self.channels.getOr(appId, null);
+            let ch = all == null ? null : all.getOr(channel, null);
+            let n = ch == null ? 0 : ch.subscribers.size();
+            self.lock.unlock();
+            return n;
+        }
+
+        // ── WebSockets ─────────────────────────────────────────────────────────
+        private fn onUpgrade(req: HttpRequest, conn: TcpStream) {
+            let origin = req.header("Origin");
+            if (self.config.allowedOrigins.size() > 0 && origin != "" && !self.config.allowedOrigins.contains(origin)) {
+                conn.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                conn.close();
+                return;
+            }
+            let ws: WebSocket = null;
+            try { ws = WebSocket.accept(req, conn); } catch (e: NetError) { return; }
+            let app = self.byKey.getOr(req.param("key"), null);
+            if (app == null) {
+                SocketsServer.sendError(ws, 4001, "App key " + req.param("key") + " does not exist");
+                ws.close();
+                return;
+            }
+            self.lock.lock();
+            let open = self.connections.get(app.id);
+            let full = app.maxConnections > 0 && open >= app.maxConnections;
+            if (!full) { self.connections.put(app.id, open + 1); }
+            self.lock.unlock();
+            if (full) {
+                SocketsServer.sendError(ws, 4004, "The app is over its connection quota");
+                ws.close();
+                return;
+            }
+            let c = new SocketConnection(SocketsServer.newSocketId(), app, ws);
+            let hello = Json.object();
+            hello.set("socket_id", c.socketId);
+            hello.set("activity_timeout", self.config.activityTimeout as long);
+            c.send("pusher:connection_established", "", hello.toJson());
+            try {
+                while (true) {
+                    let m = ws.receive();
+                    if (m == null) { break; }
+                    if (m.data.size() > self.config.maxMessageBytes) {
+                        SocketsServer.sendError(ws, 4301, "The message is too large");
+                        continue;
+                    }
+                    self.onMessage(c, m.text());
+                }
+            } catch (e: Exception) {}
+            self.leaveAll(c);
+            self.lock.lock();
+            self.connections.put(app.id, self.connections.get(app.id) - 1);
+            self.lock.unlock();
+            ws.close();
+        }
+        // "<n>.<n>" from the system's random source (each connection's thread would
+        // otherwise start the same pseudo-random sequence).
+        static fn newSocketId() -> string {
+            let r = Bytes.fromHex(Hash.randomToken(8));
+            return str(r.readUint(0, 4) % 1000000000 + 1) + "." + str(r.readUint(4, 4) % 1000000000 + 1);
+        }
+        private static fn sendError(ws: WebSocket, code: int, message: string) {
+            let d = Json.object();
+            d.set("code", code as long);
+            d.set("message", message);
+            let o = Json.object();
+            o.set("event", "pusher:error");
+            o.set("data", d.toJson());
+            try { ws.send(o.toJson()); } catch (e: Exception) {}
+        }
+        private fn onMessage(c: SocketConnection, text: string) {
+            let j: JsonValue = null;
+            try { j = Json.parse(text); } catch (e: ValueError) { SocketsServer.sendError(c.ws, 4000, "Messages are JSON"); return; }
+            if (!j.isObject() || !j.has("event")) { SocketsServer.sendError(c.ws, 4000, "A message needs an event"); return; }
+            let event = j.get("event").asString();
+            // `data` may come as an object or as JSON text
+            let data: JsonValue = j.has("data") ? j.get("data") : Json.object();
+            if (data.isString() && !Str.startsWith(event, "client-")) {
+                let parsed = Json.tryParse(data.asString());
+                if (parsed != null) { data = parsed; }
+            }
+            if (event == "pusher:ping") { c.send("pusher:pong", "", "{}"); return; }
+            if (event == "pusher:subscribe") { self.subscribe(c, data); return; }
+            if (event == "pusher:unsubscribe") {
+                if (data.isObject() && data.has("channel")) { self.leave(c, data.get("channel").asString()); }
+                return;
+            }
+            if (Str.startsWith(event, "client-")) {
+                let channel = j.has("channel") ? j.get("channel").asString() : "";
+                self.clientEvent(c, event, channel, j.has("data") ? (j.get("data").isString() ? j.get("data").asString() : j.get("data").toJson()) : "{}");
+                return;
+            }
+            SocketsServer.sendError(c.ws, 4000, "Unknown event " + event);
+        }
+
+        private fn subscribe(c: SocketConnection, data: JsonValue) {
+            if (!data.isObject() || !data.has("channel")) { SocketsServer.sendError(c.ws, 4000, "pusher:subscribe needs a channel"); return; }
+            let name = data.get("channel").asString();
+            let isPrivate = Str.startsWith(name, "private-");
+            let isPresence = Str.startsWith(name, "presence-");
+            let channelData = data.has("channel_data") ? (data.get("channel_data").isString() ? data.get("channel_data").asString() : data.get("channel_data").toJson()) : "";
+            if (isPrivate || isPresence) {
+                let auth = data.has("auth") ? data.get("auth").asString() : "";
+                let expected = PusherSignature.channelAuth(c.app.key, c.app.secret, c.socketId, name, isPresence ? channelData : "");
+                if (!Hash.equals(auth, expected)) {
+                    c.send("pusher:subscription_error", name, "{\"type\":\"AuthError\",\"error\":\"Invalid signature\",\"status\":401}");
+                    return;
+                }
+            }
+            let userId = "";
+            let info: JsonValue = Json.object();
+            if (isPresence) {
+                let cd = Json.tryParse(channelData);
+                if (cd == null || !cd.isObject() || !cd.has("user_id")) {
+                    c.send("pusher:subscription_error", name, "{\"type\":\"AuthError\",\"error\":\"presence channel_data needs a user_id\",\"status\":400}");
+                    return;
+                }
+                let uid = cd.get("user_id");
+                userId = uid.isString() ? uid.asString() : uid.toJson();
+                if (cd.has("user_info")) { info = cd.get("user_info"); }
+            }
+            let joined = false;
+            let others = new Array<SocketConnection>();
+            let presence = Json.object();
+            self.lock.lock();
+            let all = self.channels.get(c.app.id);
+            let ch = all.getOr(name, null);
+            if (ch == null) { ch = new SocketChannel(name); all.put(name, ch); }
+            let already = ch.subscribers.containsKey(c.socketId);
+            ch.subscribers.put(c.socketId, c);
+            c.channels.put(name, userId);
+            if (isPresence && !already) {
+                let m = ch.members.getOr(userId, null);
+                if (m == null) {
+                    ch.members.put(userId, new PresenceMember(info));
+                    joined = true;
+                    for ((sid, o) in ch.subscribers) { if (sid != c.socketId) { others.push(o); } }
+                } else {
+                    m.count += 1;
+                }
+            }
+            if (isPresence) {
+                let ids = Json.array();
+                let hash = Json.object();
+                for ((id, m) in ch.members) { ids.push(id); hash.set(id, m.info); }
+                let p = Json.object();
+                p.set("ids", ids);
+                p.set("hash", hash);
+                p.set("count", ch.members.size() as long);
+                presence.set("presence", p);
+            }
+            self.lock.unlock();
+            c.send("pusher_internal:subscription_succeeded", name, isPresence ? presence.toJson() : "{}");
+            if (joined) {
+                let added = Json.object();
+                added.set("user_id", userId);
+                added.set("user_info", info);
+                for (o in others) { o.send("pusher_internal:member_added", name, added.toJson()); }
+            }
+        }
+
+        private fn leave(c: SocketConnection, name: string) {
+            let left = "";
+            let others = new Array<SocketConnection>();
+            self.lock.lock();
+            let all = self.channels.get(c.app.id);
+            let ch = all.getOr(name, null);
+            if (ch != null && ch.subscribers.containsKey(c.socketId)) {
+                ch.subscribers.remove(c.socketId);
+                let uid = c.channels.getOr(name, "");
+                if (ch.isPresence()) {
+                    let m = ch.members.getOr(uid, null);
+                    if (m != null) {
+                        m.count -= 1;
+                        if (m.count <= 0) {
+                            ch.members.remove(uid);
+                            left = uid;
+                            for ((_, o) in ch.subscribers) { others.push(o); }
+                        }
+                    }
+                }
+                if (ch.subscribers.size() == 0) { all.remove(name); }
+            }
+            c.channels.remove(name);
+            self.lock.unlock();
+            if (left != "") {
+                let gone = Json.object();
+                gone.set("user_id", left);
+                for (o in others) { o.send("pusher_internal:member_removed", name, gone.toJson()); }
+            }
+        }
+        private fn leaveAll(c: SocketConnection) {
+            for (name in c.channels.keys()) { self.leave(c, name); }
+        }
+
+        // A client- event: to the others on a private or presence channel the
+        // sender is subscribed to.
+        private fn clientEvent(c: SocketConnection, event: string, channel: string, data: string) {
+            if (!c.app.clientEvents) { SocketsServer.sendError(c.ws, 4301, "Client events are not enabled for this app"); return; }
+            if (!Str.startsWith(channel, "private-") && !Str.startsWith(channel, "presence-")) {
+                SocketsServer.sendError(c.ws, 4301, "Client events are only for private and presence channels");
+                return;
+            }
+            if (!c.channels.containsKey(channel)) { SocketsServer.sendError(c.ws, 4301, "Not subscribed to " + channel); return; }
+            let to = new Array<SocketConnection>();
+            self.lock.lock();
+            let ch = self.channels.get(c.app.id).getOr(channel, null);
+            if (ch != null) { for ((sid, o) in ch.subscribers) { if (sid != c.socketId) { to.push(o); } } }
+            let uid = c.channels.getOr(channel, "");
+            self.lock.unlock();
+            let o = Json.object();
+            o.set("event", event);
+            o.set("channel", channel);
+            o.set("data", data);
+            if (uid != "") { o.set("user_id", uid); }
+            let text = o.toJson();
+            for (t in to) { try { t.ws.send(text); } catch (e: Exception) {} }
+        }
+    }
+}
