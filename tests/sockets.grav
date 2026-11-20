@@ -1,0 +1,221 @@
+// apogee-sockets' tests: a server on a free port, WebSocket clients speaking
+// the Pusher protocol, and signed HTTP API calls: connecting, pings, public,
+// private and presence channels, client events, triggering (and leaving a
+// socket out), the API's channel queries, and refused requests.
+import "std"
+import "std/net"
+import "../src/sockets.grav"
+use apogee.*
+
+const KEY: string = "app-key"
+const SECRET: string = "app-secret"
+
+fn server() -> SocketsServer {
+    let s = new SocketsServer(new SocketsConfig([new SocketsApp("app-id", KEY, SECRET)]))
+    return s.start("127.0.0.1", 0)
+}
+
+fn connect(s: SocketsServer) -> WebSocket {
+    return WebSocket.connect("ws://127.0.0.1:${s.port()}/app/${KEY}?protocol=7&client=js", 5000)
+}
+
+// The next message, parsed.
+fn next(ws: WebSocket) -> JsonValue {
+    let m = ws.receive()
+    assert(m != null)
+    return Json.parse(m.text())
+}
+
+// The `data` of a message, parsed (it travels as JSON text).
+fn dataOf(m: JsonValue) -> JsonValue { return Json.parse(m.get("data").asString()) }
+
+fn socketIdOf(ws: WebSocket) -> string {
+    let hello = next(ws)
+    assertEq(hello.get("event").asString(), "pusher:connection_established")
+    return dataOf(hello).get("socket_id").asString()
+}
+
+fn send(ws: WebSocket, event: string, data: JsonValue, channel: string = "") {
+    let o = Json.object()
+    o.set("event", event)
+    if (channel != "") { o.set("channel", channel) }
+    o.set("data", data)
+    ws.send(o.toJson())
+}
+
+fn subscribe(ws: WebSocket, channel: string, auth: string = "", channelData: string = "") -> JsonValue {
+    let d = Json.object()
+    d.set("channel", channel)
+    if (auth != "") { d.set("auth", auth) }
+    if (channelData != "") { d.set("channel_data", channelData) }
+    send(ws, "pusher:subscribe", d)
+    return next(ws)
+}
+
+// A signed HTTP API request.
+fn api(s: SocketsServer, method: string, path: string, body: string, secret: string = SECRET, info: string = "") -> HttpResponse {
+    let p = PusherSignature.params()
+    if (info != "") { p.put("info", info) }
+    p.put("auth_key", KEY)
+    p.put("auth_timestamp", str(Time.now()))
+    p.put("auth_version", "1.0")
+    if (body != "") { p.put("body_md5", Hash.md5(body)) }
+    let sig = PusherSignature.apiSignature(secret, method, path, p)
+    let url = "http://127.0.0.1:${s.port()}" + path + "?" + PusherSignature.queryString(p) + "&auth_signature=" + sig
+    let c = new HttpClient()
+    return method == "POST" ? c.post(url, body, "application/json") : c.get(url)
+}
+
+fn triggerBody(channels: Array<string>, name: string, data: string, except: string = "") -> string {
+    let o = Json.object()
+    o.set("name", name)
+    let cs = Json.array()
+    for (c in channels) { cs.push(c) }
+    o.set("channels", cs)
+    o.set("data", data)
+    if (except != "") { o.set("socket_id", except) }
+    return o.toJson()
+}
+
+test "connecting, and pings" {
+    let s = server()
+    let ws = connect(s)
+    let id = socketIdOf(ws)
+    assert(Str.contains(id, "."))
+    send(ws, "pusher:ping", Json.object())
+    assertEq(next(ws).get("event").asString(), "pusher:pong")
+    ws.close()
+    s.stop()
+}
+
+test "a public channel gets events from the HTTP API" {
+    let s = server()
+    let ws = connect(s)
+    socketIdOf(ws)
+    assertEq(subscribe(ws, "orders").get("event").asString(), "pusher_internal:subscription_succeeded")
+    let res = api(s, "POST", "/apps/app-id/events", triggerBody(["orders"], "OrderShipped", "{\"id\":42}"))
+    assertEq(res.status, 200)
+    let m = next(ws)
+    assertEq(m.get("event").asString(), "OrderShipped")
+    assertEq(m.get("channel").asString(), "orders")
+    assertEq(dataOf(m).get("id").asInt(), 42)
+    assertEq(s.subscriptionCount("app-id", "orders"), 1)
+    ws.close()
+    s.stop()
+}
+
+test "private channels need the app's signature" {
+    let s = server()
+    let ws = connect(s)
+    let id = socketIdOf(ws)
+    let bad = subscribe(ws, "private-orders.7", KEY + ":0000")
+    assertEq(bad.get("event").asString(), "pusher:subscription_error")
+    let none = subscribe(ws, "private-orders.7")
+    assertEq(none.get("event").asString(), "pusher:subscription_error")
+    let ok = subscribe(ws, "private-orders.7", PusherSignature.channelAuth(KEY, SECRET, id, "private-orders.7"))
+    assertEq(ok.get("event").asString(), "pusher_internal:subscription_succeeded")
+    api(s, "POST", "/apps/app-id/events", triggerBody(["private-orders.7"], "Paid", "{}"))
+    assertEq(next(ws).get("event").asString(), "Paid")
+    ws.close()
+    s.stop()
+}
+
+fn joinPresence(ws: WebSocket, id: string, channel: string, userId: string, name: string) -> JsonValue {
+    let cd = "{\"user_id\":\"" + userId + "\",\"user_info\":{\"name\":\"" + name + "\"}}"
+    return subscribe(ws, channel, PusherSignature.channelAuth(KEY, SECRET, id, channel, cd), cd)
+}
+
+test "presence channels say who is there, and who comes and goes" {
+    let s = server()
+    let a = connect(s)
+    let aid = socketIdOf(a)
+    let b = connect(s)
+    let bid = socketIdOf(b)
+    let first = joinPresence(a, aid, "presence-chat.1", "1", "Ada")
+    assertEq(dataOf(first).get("presence").get("count").asInt(), 1)
+    let second = joinPresence(b, bid, "presence-chat.1", "2", "Bo")
+    let p = dataOf(second).get("presence")
+    assertEq(p.get("count").asInt(), 2)
+    assertEq(p.get("hash").get("1").get("name").asString(), "Ada")
+    let added = next(a)
+    assertEq(added.get("event").asString(), "pusher_internal:member_added")
+    assertEq(dataOf(added).get("user_id").asString(), "2")
+    let users = Json.parse(api(s, "GET", "/apps/app-id/channels/presence-chat.1/users", "").body())
+    assertEq(users.get("users").size(), 2)
+    b.close()
+    let removed = next(a)
+    assertEq(removed.get("event").asString(), "pusher_internal:member_removed")
+    assertEq(dataOf(removed).get("user_id").asString(), "2")
+    a.close()
+    s.stop()
+}
+
+test "client events reach the others on the channel" {
+    let s = server()
+    let a = connect(s)
+    let aid = socketIdOf(a)
+    let b = connect(s)
+    let bid = socketIdOf(b)
+    subscribe(a, "private-room", PusherSignature.channelAuth(KEY, SECRET, aid, "private-room"))
+    subscribe(b, "private-room", PusherSignature.channelAuth(KEY, SECRET, bid, "private-room"))
+    let typing = Json.object()
+    typing.set("who", "ada")
+    send(a, "client-typing", typing, "private-room")
+    let m = next(b)
+    assertEq(m.get("event").asString(), "client-typing")
+    assertEq(Json.parse(m.get("data").isString() ? m.get("data").asString() : m.get("data").toJson()).get("who").asString(), "ada")
+    // the sender does not get its own event: the next thing it sees is this one
+    api(s, "POST", "/apps/app-id/events", triggerBody(["private-room"], "after", "{}"))
+    assertEq(next(a).get("event").asString(), "after")
+    // not on a public channel
+    subscribe(a, "lobby")
+    send(a, "client-hi", Json.object(), "lobby")
+    assertEq(next(a).get("event").asString(), "pusher:error")
+    a.close()
+    b.close()
+    s.stop()
+}
+
+test "an event can leave out the socket that caused it" {
+    let s = server()
+    let a = connect(s)
+    let aid = socketIdOf(a)
+    let b = connect(s)
+    socketIdOf(b)
+    subscribe(a, "feed")
+    subscribe(b, "feed")
+    api(s, "POST", "/apps/app-id/events", triggerBody(["feed"], "first", "{}", aid))
+    api(s, "POST", "/apps/app-id/events", triggerBody(["feed"], "second", "{}"))
+    assertEq(next(b).get("event").asString(), "first")
+    assertEq(next(a).get("event").asString(), "second")   // a skipped "first"
+    a.close()
+    b.close()
+    s.stop()
+}
+
+test "the HTTP API: channel queries and refused requests" {
+    let s = server()
+    let ws = connect(s)
+    socketIdOf(ws)
+    subscribe(ws, "orders")
+    let chans = Json.parse(api(s, "GET", "/apps/app-id/channels", "").body())
+    assert(chans.get("channels").has("orders"))
+    let one = Json.parse(api(s, "GET", "/apps/app-id/channels/orders", "", SECRET, "subscription_count").body())
+    assert(one.get("occupied").asBool())
+    assertEq(one.get("subscription_count").asInt(), 1)
+    assertEq(api(s, "POST", "/apps/app-id/events", triggerBody(["orders"], "x", "{}"), "wrong-secret").status, 401)
+    assertEq(api(s, "POST", "/apps/no-such-app/events", "{}").status, 404)
+    assertEq(api(s, "POST", "/apps/app-id/events", "{\"name\":\"x\"}").status, 400)
+    assertEq(new HttpClient().get("http://127.0.0.1:${s.port()}/up").status, 200)
+    ws.close()
+    s.stop()
+}
+
+test "an unknown app key is refused" {
+    let s = server()
+    let ws = WebSocket.connect("ws://127.0.0.1:${s.port()}/app/nope?protocol=7", 5000)
+    let m = next(ws)
+    assertEq(m.get("event").asString(), "pusher:error")
+    assertEq(dataOf(m).get("code").asInt(), 4001)
+    s.stop()
+}
