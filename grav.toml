@@ -1,0 +1,6 @@
+name = "apogee-sockets"
+lib = "src/sockets.grav"
+grav = ">=1.10.0"
+paths = ["src"]
+
+[dependencies]
