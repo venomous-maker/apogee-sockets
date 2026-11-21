@@ -6,6 +6,14 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Performance
+
+- An event is encoded once per channel instead of once per recipient: fanning
+  one out to 100 subscribers takes 43% fewer instructions, and delivery went
+  from about 84,000 to about 104,000 messages a second.
+- Each app's channels have their own lock, so busy apps do not wait on each
+  other.
+
 ## 0.1.0 (2026-11-20)
 
 The first release. Needs grav 1.10.0 or newer.
