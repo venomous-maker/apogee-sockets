@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.1 (2026-11-21)
+
 ### Performance
 
 - An event is encoded once per channel instead of once per recipient: fanning
