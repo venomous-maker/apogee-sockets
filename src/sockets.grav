@@ -126,7 +126,7 @@ namespace apogee {
         // app id -> channel name -> channel
         private channels: HashMap<string, HashMap<string, SocketChannel>>
         private connections: HashMap<string, int>   // app id -> open connections
-        private lock: Mutex
+        private locks: HashMap<string, Mutex>       // app id -> the lock over its channels (read-only map)
 
         constructor(config: SocketsConfig) {
             self.config = config;
@@ -134,16 +134,20 @@ namespace apogee {
             self.byId = new HashMap<string, SocketsApp>();
             self.channels = new HashMap<string, HashMap<string, SocketChannel>>();
             self.connections = new HashMap<string, int>();
-            self.lock = new Mutex();
+            self.locks = new HashMap<string, Mutex>();
             for (a in config.apps) {
                 self.byKey.put(a.key, a);
                 self.byId.put(a.id, a);
                 self.channels.put(a.id, new HashMap<string, SocketChannel>());
                 self.connections.put(a.id, 0);
+                self.locks.put(a.id, new Mutex());
             }
             self.http = new HttpServer();
             self.routes();
         }
+
+        // Each app's channels have their own lock, so busy apps do not wait on each other.
+        private fn lockFor(appId: string) -> Mutex { return self.locks.get(appId); }
 
         // Serves (blocks).
         fn serve(host: string, port: int) { self.http.listen(host, port); }
@@ -223,25 +227,25 @@ namespace apogee {
             let withUsers = Str.contains(params.getOr("info", ""), "user_count");
             let out = Json.object();
             let list = Json.object();
-            self.lock.lock();
+            self.lockFor(app.id).lock();
             for ((name, ch) in self.channels.get(app.id)) {
                 if (ch.subscribers.size() == 0 || !Str.startsWith(name, prefix)) { continue; }
                 let info = Json.object();
                 if (withUsers && ch.isPresence()) { info.set("user_count", ch.members.size() as long); }
                 list.set(name, info);
             }
-            self.lock.unlock();
+            self.lockFor(app.id).unlock();
             out.set("channels", list);
             return HttpResponse.json(200, out);
         }
         private fn apiChannel(app: SocketsApp, name: string, params: SortedMap<string, string>) -> HttpResponse {
             let info = params.getOr("info", "");
             let out = Json.object();
-            self.lock.lock();
+            self.lockFor(app.id).lock();
             let ch = self.channels.get(app.id).getOr(name, null);
             let subs = ch == null ? 0 : ch.subscribers.size();
             let users = ch == null ? 0 : ch.members.size();
-            self.lock.unlock();
+            self.lockFor(app.id).unlock();
             out.set("occupied", subs > 0);
             if (Str.contains(info, "subscription_count")) { out.set("subscription_count", subs as long); }
             if (Str.contains(info, "user_count") && Str.startsWith(name, "presence-")) { out.set("user_count", users as long); }
@@ -250,7 +254,7 @@ namespace apogee {
         private fn apiUsers(app: SocketsApp, name: string) -> HttpResponse {
             if (!Str.startsWith(name, "presence-")) { return SocketsServer.error(400, "users are only for presence channels"); }
             let users = Json.array();
-            self.lock.lock();
+            self.lockFor(app.id).lock();
             let ch = self.channels.get(app.id).getOr(name, null);
             if (ch != null) {
                 for ((id, _) in ch.members) {
@@ -259,7 +263,7 @@ namespace apogee {
                     users.push(u);
                 }
             }
-            self.lock.unlock();
+            self.lockFor(app.id).unlock();
             let out = Json.object();
             out.set("users", users);
             return HttpResponse.json(200, out);
@@ -269,29 +273,37 @@ namespace apogee {
         // Sends `event` (its data: JSON text) to everyone on `channels`, but the
         // connection `exceptSocket`.
         fn trigger(appId: string, channels: Array<string>, event: string, data: string, exceptSocket: string = "") {
+            if (!self.locks.containsKey(appId)) { return; }
             let to = new Array<SocketConnection>();
-            let chans = new Array<string>();
-            self.lock.lock();
-            let all = self.channels.getOr(appId, null);
-            if (all != null) {
-                for (name in channels) {
-                    let ch = all.getOr(name, null);
-                    if (ch == null) { continue; }
-                    for ((sid, c) in ch.subscribers) {
-                        if (sid != exceptSocket) { to.push(c); chans.push(name); }
-                    }
-                }
+            let texts = new Array<string>();    // the message for each of `to`, made once per channel
+            let lock = self.lockFor(appId);
+            for (name in channels) {
+                lock.lock();
+                let ch = self.channels.get(appId).getOr(name, null);
+                let from = to.size();
+                if (ch != null) { for ((sid, c) in ch.subscribers) { if (sid != exceptSocket) { to.push(c); } } }
+                lock.unlock();
+                if (to.size() == from) { continue; }
+                let text = SocketsServer.message(event, name, data);
+                for (i in from..to.size()) { texts.push(text); }
             }
-            self.lock.unlock();
-            for (i in 0..to.size()) { to[i].send(event, chans[i], data); }
+            for (i in 0..to.size()) { try { to[i].ws.send(texts[i]); } catch (e: Exception) {} }
+        }
+        // {"event", "channel", "data"} as text.
+        static fn message(event: string, channel: string, data: string) -> string {
+            let o = Json.object();
+            o.set("event", event);
+            if (channel != "") { o.set("channel", channel); }
+            o.set("data", data);
+            return o.toJson();
         }
         // How many connections are subscribed to a channel.
         fn subscriptionCount(appId: string, channel: string) -> int {
-            self.lock.lock();
+            self.lockFor(appId).lock();
             let all = self.channels.getOr(appId, null);
             let ch = all == null ? null : all.getOr(channel, null);
             let n = ch == null ? 0 : ch.subscribers.size();
-            self.lock.unlock();
+            self.lockFor(appId).unlock();
             return n;
         }
 
@@ -311,11 +323,11 @@ namespace apogee {
                 ws.close();
                 return;
             }
-            self.lock.lock();
+            self.lockFor(app.id).lock();
             let open = self.connections.get(app.id);
             let full = app.maxConnections > 0 && open >= app.maxConnections;
             if (!full) { self.connections.put(app.id, open + 1); }
-            self.lock.unlock();
+            self.lockFor(app.id).unlock();
             if (full) {
                 SocketsServer.sendError(ws, 4004, "The app is over its connection quota");
                 ws.close();
@@ -338,9 +350,9 @@ namespace apogee {
                 }
             } catch (e: Exception) {}
             self.leaveAll(c);
-            self.lock.lock();
+            self.lockFor(app.id).lock();
             self.connections.put(app.id, self.connections.get(app.id) - 1);
-            self.lock.unlock();
+            self.lockFor(app.id).unlock();
             ws.close();
         }
         // "<n>.<n>" from the system's random source (each connection's thread would
@@ -412,7 +424,7 @@ namespace apogee {
             let joined = false;
             let others = new Array<SocketConnection>();
             let presence = Json.object();
-            self.lock.lock();
+            self.lockFor(c.app.id).lock();
             let all = self.channels.get(c.app.id);
             let ch = all.getOr(name, null);
             if (ch == null) { ch = new SocketChannel(name); all.put(name, ch); }
@@ -439,7 +451,7 @@ namespace apogee {
                 p.set("count", ch.members.size() as long);
                 presence.set("presence", p);
             }
-            self.lock.unlock();
+            self.lockFor(c.app.id).unlock();
             c.send("pusher_internal:subscription_succeeded", name, isPresence ? presence.toJson() : "{}");
             if (joined) {
                 let added = Json.object();
@@ -452,7 +464,7 @@ namespace apogee {
         private fn leave(c: SocketConnection, name: string) {
             let left = "";
             let others = new Array<SocketConnection>();
-            self.lock.lock();
+            self.lockFor(c.app.id).lock();
             let all = self.channels.get(c.app.id);
             let ch = all.getOr(name, null);
             if (ch != null && ch.subscribers.containsKey(c.socketId)) {
@@ -472,7 +484,7 @@ namespace apogee {
                 if (ch.subscribers.size() == 0) { all.remove(name); }
             }
             c.channels.remove(name);
-            self.lock.unlock();
+            self.lockFor(c.app.id).unlock();
             if (left != "") {
                 let gone = Json.object();
                 gone.set("user_id", left);
@@ -493,11 +505,11 @@ namespace apogee {
             }
             if (!c.channels.containsKey(channel)) { SocketsServer.sendError(c.ws, 4301, "Not subscribed to " + channel); return; }
             let to = new Array<SocketConnection>();
-            self.lock.lock();
+            self.lockFor(c.app.id).lock();
             let ch = self.channels.get(c.app.id).getOr(channel, null);
             if (ch != null) { for ((sid, o) in ch.subscribers) { if (sid != c.socketId) { to.push(o); } } }
             let uid = c.channels.getOr(channel, "");
-            self.lock.unlock();
+            self.lockFor(c.app.id).unlock();
             let o = Json.object();
             o.set("event", event);
             o.set("channel", channel);
