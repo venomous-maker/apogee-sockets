@@ -1,6 +1,9 @@
 name = "apogee-sockets"
-lib = "src/sockets.grav"
-grav = ">=1.10.0"
+lib = "src/all.grav"
+grav = ">=1.12.0"
 paths = ["src"]
 
 [dependencies]
+apogee-package = { path = "/home/venom/CLionProjects/Practice/apogee-package" }
+apogee-config = "github.com/venomous-maker/apogee-config@v0.2.0"
+apogee-console = "github.com/venomous-maker/apogee-console@v0.2.1"
