@@ -1,0 +1,35 @@
+// package.grav — how apogee-sockets connects itself to an app
+// (apogee-package): sockets:serve, the WebSockets (Pusher protocol) server for
+// broadcasting, with the app's broadcasting credentials.
+import "std"
+import "apogee-config"
+import "apogee-package"
+import "apogee-console"
+import "sockets.grav"
+
+namespace apogee {
+
+    class SocketsPackage extends ApogeePackage {
+        constructor() {}
+        fn name() -> string { return "sockets"; }
+        fn defaults() -> HashMap<string, any> {
+            return {"sockets.host": Env.get("SOCKETS_HOST", "0.0.0.0"), "sockets.port": Env.getInt("SOCKETS_PORT", 6001)};
+        }
+        fn commands() -> Array<any> { return [new SocketsServeCommand() as any]; }
+    }
+
+    class SocketsServeCommand extends ConsoleCommand {
+        constructor() {}
+        fn signature() -> string { return "sockets:serve {--host= : The address to listen on} {--port= : The port}"; }
+        fn description() -> string { return "Serve WebSockets (the Pusher protocol) for broadcasting"; }
+        fn handle() -> int {
+            let s = "broadcasting.connections.sockets.";
+            let host = self.option("host") != "" ? self.option("host") : Config.getString("sockets.host", "0.0.0.0");
+            let port = self.option("port") != "" ? self.optionInt("port") as int : Config.getInt("sockets.port", 6001) as int;
+            let apps: Array<SocketsApp> = [new SocketsApp(Config.getString(s + "app_id", "apogee"), Config.getString(s + "key", "apogee-key"), Config.getString(s + "secret"))];
+            self.output.infoBlock("Sockets running on [ws://" + (host == "0.0.0.0" ? "127.0.0.1" : host) + ":${port}]. Press Ctrl+C to stop.");
+            new SocketsServer(new SocketsConfig(apps)).serve(host, port);
+            return 0;
+        }
+    }
+}
