@@ -6,6 +6,11 @@ compiler versions it builds with.
 
 ## Unreleased
 
+Needs grav 1.12.0 or newer.
+
+- `SocketsPackage`: the module connects itself to an apogee-framework app (apogee-package):
+  its settings, wiring and commands moved here from the framework.
+
 ## 0.1.1 (2026-11-21)
 
 ### Performance
