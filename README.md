@@ -26,6 +26,20 @@ const pusher = new Pusher("app-key", { wsHost: "example.com", wsPort: 6001, forc
 pusher.subscribe("private-orders.7").bind("OrderShipped", (e) => show(e))
 ```
 
+## In an apogee-framework app
+
+Importing the module is all it takes: `SocketsPackage` (apogee-package) connects it when
+the app is created. `sockets:serve` runs the server with the app's broadcasting credentials (`broadcasting.connections.sockets.*`, set by apogee-broadcast); `--host` and `--port` override the settings.
+
+**Commands:** `sockets:serve`.
+
+| Setting | Default |
+|---|---|
+| `sockets.host` | `SOCKETS_HOST`, `0.0.0.0` |
+| `sockets.port` | `SOCKETS_PORT`, 6001 |
+
+Your own configuration wins over these defaults.
+
 ## Channels
 
 - **public** (`orders`): anyone may subscribe.
@@ -75,4 +89,5 @@ library's `HttpServer.listenTls`.
 
 ```bash
 grav test tests/sockets.grav
+grav test tests/package.grav
 ```
