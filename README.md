@@ -7,7 +7,7 @@ server's HTTP API, with [apogee-broadcast](https://github.com/venomous-maker/apo
 `SocketsBroadcaster` or any Pusher server library. Checked against the
 official `pusher-js` client and `pusher` server library.
 
-```grav
+```typescript
 import "std"
 import "apogee-sockets"
 use apogee.*
